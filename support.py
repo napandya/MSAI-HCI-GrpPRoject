@@ -1,16 +1,18 @@
 """LLM-driven support responses for StreamHub, grounded in a fixed policy prompt.
 
-Replies stream word by word and are sped up two ways:
-- a response cache: an identical question in an identical conversation is answered
-  instantly from disk (decoding is greedy, so the model would give the same answer anyway);
-- a prompt prefix cache: the fixed policy/system prompt is run through the model once at
-  startup, and every request reuses that work instead of re-reading the whole policy.
+Each message goes through:
+1. guardrails (guard.py): rule checks for instruction-override attempts and sensitive data,
+   then a model-based scope check; off-topic messages get a graceful, model-written redirect;
+2. a response cache: an identical question in an identical conversation is answered
+   instantly from disk (decoding is greedy, so the model would give the same answer anyway);
+3. streaming generation, sped up by a prompt prefix cache: each fixed system prompt is run
+   through the model once at startup and every request reuses that work.
 
 Works with two kinds of Hugging Face models, picked by STREAMHUB_MODEL:
 - chat-tuned decoder models such as Qwen/Qwen2.5-0.5B-Instruct (the default), which get
   the policy as a system message plus the conversation through the model's chat template;
 - encoder-decoder instruction models such as google/flan-t5-base, which get one
-  flattened text prompt.
+  flattened text prompt (the model-based scope check is skipped for these).
 """
 import copy
 import hashlib
@@ -21,10 +23,16 @@ import threading
 import time
 from functools import lru_cache
 
+import guard
+
 logger = logging.getLogger("streamhub")
 
 MODEL_NAME = os.environ.get("STREAMHUB_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
 CACHE_FILE = os.environ.get("STREAMHUB_CACHE_FILE", os.path.join(".cache", "streamhub_responses.json"))
+SCOPE_CHECK = os.environ.get("STREAMHUB_SCOPE_CHECK", "on").strip().lower() not in ("0", "off", "false", "no")
+# A message is treated as off-topic only if the model is at least this sure. Set above 0.5
+# on purpose: wrongly refusing a real support question is worse than answering a borderline one.
+OFF_TOPIC_THRESHOLD = float(os.environ.get("STREAMHUB_OFFTOPIC_THRESHOLD", "0.65"))
 MAX_NEW_TOKENS = 120
 
 SUPPORT_FACTS = """StreamHub is a fictional streaming service.
@@ -90,11 +98,22 @@ def clean_history(history):
     return turns[-MAX_HISTORY_TURNS:]
 
 
-def build_messages(message, history):
-    """Chat-format messages for chat-tuned models: system policy, prior turns, new message."""
-    return ([{"role": "system", "content": SYSTEM_PROMPT}]
+def build_messages(message, history, system_prompt=SYSTEM_PROMPT):
+    """Chat-format messages for chat-tuned models: system prompt, prior turns, new message."""
+    return ([{"role": "system", "content": system_prompt}]
             + clean_history(history)
             + [{"role": "user", "content": message}])
+
+
+def build_scope_messages(message, history):
+    """Messages for the scope check: the last assistant turn gives context for follow-ups."""
+    last_reply = next((turn["content"] for turn in reversed(clean_history(history))
+                       if turn["role"] == "assistant"), "(none)")
+    user = (f"Previous assistant message: {last_reply}\n"
+            f"Customer message: {message}\n"
+            "Is the customer message in scope? Answer yes or no.")
+    return [{"role": "system", "content": guard.SCOPE_SYSTEM_PROMPT},
+            {"role": "user", "content": user}]
 
 
 def build_prompt(message, history):
@@ -120,10 +139,10 @@ def _normalize(text):
 class ResponseCache:
     """Exact-match reply cache, kept in memory and saved to a JSON file between runs.
 
-    The key covers the model, the full system prompt, generation settings, the new
-    message and the recent conversation, so a cached reply is only reused when the
-    model would see exactly the same input. Editing the policy or switching models
-    automatically stops old entries from matching.
+    The key covers the model, every prompt the bot uses, the guard and generation
+    settings, the new message and the recent conversation, so a cached reply is only
+    reused when the model would see exactly the same input. Editing a prompt or
+    switching models automatically stops old entries from matching.
     """
 
     def __init__(self, path=None):
@@ -142,7 +161,9 @@ class ResponseCache:
     def key(message, history):
         payload = json.dumps({
             "model": MODEL_NAME,
-            "system": SYSTEM_PROMPT,
+            "prompts": [SYSTEM_PROMPT, guard.SCOPE_SYSTEM_PROMPT, guard.OFF_TOPIC_SYSTEM_PROMPT],
+            "scope_check": SCOPE_CHECK,
+            "threshold": OFF_TOPIC_THRESHOLD,
             "max_new_tokens": MAX_NEW_TOKENS,
             "history": [[t["role"], _normalize(t["content"])] for t in clean_history(history)],
             "message": _normalize(message),
@@ -198,7 +219,7 @@ def _run_streaming(model, streamer, **generate_kwargs):
 
 
 class LocalModel:
-    """Loaded model plus a streaming generate method: stream(message, history) -> text chunks."""
+    """Loaded model with streaming generation and a yes/no scope check."""
 
     def __init__(self, name):
         import torch
@@ -212,8 +233,7 @@ class LocalModel:
         config = AutoConfig.from_pretrained(name)
         self.tokenizer = AutoTokenizer.from_pretrained(name)
         self.is_chat = not getattr(config, "is_encoder_decoder", False)
-        self.prefix_ids = None
-        self.prefix_cache = None
+        self.prefix_caches = {}  # system prompt -> (token ids, attention cache)
 
         if self.is_chat:
             if getattr(self.tokenizer, "chat_template", None) is None:
@@ -222,45 +242,73 @@ class LocalModel:
             self.model.eval()
             self.pad_id = (self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None
                            else self.tokenizer.eos_token_id)
-            self._build_prefix_cache()
+            self.yes_ids = self._first_token_ids(["yes", "Yes", " yes", " Yes"])
+            self.no_ids = self._first_token_ids(["no", "No", " no", " No"])
+            for prompt in (SYSTEM_PROMPT, guard.SCOPE_SYSTEM_PROMPT, guard.OFF_TOPIC_SYSTEM_PROMPT):
+                self._build_prefix_cache(prompt)
         else:
             self.model = AutoModelForSeq2SeqLM.from_pretrained(name)
             self.model.eval()
         logger.info("Loaded %s as a %s model in %.1fs.", name,
                     "chat" if self.is_chat else "encoder-decoder", time.perf_counter() - start)
 
-    def _build_prefix_cache(self):
-        """Run the fixed system prompt through the model once and keep its attention cache.
+    def _first_token_ids(self, words):
+        ids = {self.tokenizer.encode(word, add_special_tokens=False)[0] for word in words}
+        return sorted(ids)
 
-        Every conversation starts with the same system prompt, so each request can copy
-        this cache and only process the conversation turns that follow it.
+    def _build_prefix_cache(self, system_prompt):
+        """Run a fixed system prompt through the model once and keep its attention cache.
+
+        Every request that starts with this system prompt copies the cache and only
+        processes the tokens that follow it.
         """
         prefix = self.tokenizer.apply_chat_template(
-            [{"role": "system", "content": SYSTEM_PROMPT}],
+            [{"role": "system", "content": system_prompt}],
             add_generation_prompt=False, return_tensors="pt", return_dict=True)
         with self.torch.inference_mode():
             output = self.model(**prefix, use_cache=True)
-        self.prefix_ids = prefix["input_ids"]
-        self.prefix_cache = output.past_key_values
-        logger.info("Cached the %d-token system prompt for reuse.", self.prefix_ids.shape[-1])
+        self.prefix_caches[system_prompt] = (prefix["input_ids"], output.past_key_values)
+        logger.info("Cached a %d-token system prompt for reuse.", prefix["input_ids"].shape[-1])
 
-    def _chat_inputs(self, message, history):
+    def _chat_inputs(self, messages):
+        """Tokenize chat messages; attach a copy of the matching prefix cache when it applies."""
         inputs = self.tokenizer.apply_chat_template(
-            build_messages(message, history),
-            add_generation_prompt=True, return_tensors="pt", return_dict=True)
-        extra = {}
-        if self.prefix_cache is not None:
-            n = self.prefix_ids.shape[-1]
+            messages, add_generation_prompt=True, return_tensors="pt", return_dict=True)
+        cached = self.prefix_caches.get(messages[0]["content"])
+        if cached is not None:
+            prefix_ids, prefix_cache = cached
+            n = prefix_ids.shape[-1]
             full = inputs["input_ids"]
             # Only reuse the cache if this prompt really starts with the cached tokens.
-            if full.shape[-1] > n and self.torch.equal(full[:, :n], self.prefix_ids):
-                extra["past_key_values"] = copy.deepcopy(self.prefix_cache)
-        return inputs, extra
+            if full.shape[-1] > n and self.torch.equal(full[:, :n], prefix_ids):
+                return inputs, copy.deepcopy(prefix_cache), n
+        return inputs, None, 0
 
-    def stream(self, message, history):
+    def off_topic_probability(self, message, history):
+        """Probability (0-1) that the message is out of scope, from the model's yes/no scores.
+
+        One forward pass, no text generation: compares the model's score for answering
+        "yes" (in scope) against "no" (out of scope).
+        """
+        inputs, past, n_cached = self._chat_inputs(build_scope_messages(message, history))
+        with self.torch.inference_mode():
+            if past is not None:
+                output = self.model(input_ids=inputs["input_ids"][:, n_cached:],
+                                    attention_mask=inputs["attention_mask"],
+                                    past_key_values=past, use_cache=True)
+            else:
+                output = self.model(**inputs)
+        logits = output.logits[0, -1]
+        yes = logits[self.yes_ids].max()
+        no = logits[self.no_ids].max()
+        return self.torch.softmax(self.torch.stack([yes, no]), dim=0)[1].item()
+
+    def stream(self, message, history, system_prompt=SYSTEM_PROMPT):
+        """Yield the reply as text chunks while it is generated."""
         streamer = self.streamer_cls(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
         if self.is_chat:
-            inputs, extra = self._chat_inputs(message, history)
+            inputs, past, _ = self._chat_inputs(build_messages(message, history, system_prompt))
+            extra = {"past_key_values": past} if past is not None else {}
             yield from _run_streaming(self.model, streamer, **inputs, **extra,
                                       max_new_tokens=MAX_NEW_TOKENS, do_sample=False,
                                       repetition_penalty=1.1, pad_token_id=self.pad_id)
@@ -279,13 +327,24 @@ def _get_generator():
 
 
 def warm_up():
-    """Load the model (and build the prompt cache) at startup so errors show immediately."""
+    """Load the model (and build the prompt caches) at startup so errors show immediately."""
     try:
         _get_generator()
         return True
     except Exception:
         logger.exception("Could not load %s", MODEL_NAME)
         return False
+
+
+def is_off_topic(model, message, history):
+    """Model-based scope check; returns False (answer normally) when the check is unavailable."""
+    if not SCOPE_CHECK or not getattr(model, "is_chat", False):
+        return False
+    p_off = model.off_topic_probability(message, history)
+    off_topic = p_off >= OFF_TOPIC_THRESHOLD
+    logger.info("Scope check: %s (off-topic probability %.2f, threshold %.2f).",
+                "OFF-TOPIC" if off_topic else "in scope", p_off, OFF_TOPIC_THRESHOLD)
+    return off_topic
 
 
 # ---------------------------------------------------------------- public API used by the app
@@ -299,6 +358,12 @@ def stream_response(message, history):
         yield HELP_TEXT
         return
 
+    checked = guard.check_input(message)
+    if checked.blocked:
+        logger.info("Guard blocked a message (%s); model not called.", checked.kind)
+        yield checked.reply
+        return
+
     cached = CACHE.get(message, history)
     if cached is not None:
         logger.info("Cache hit: answered instantly.")
@@ -309,7 +374,13 @@ def stream_response(message, history):
     first_token_at = None
     text = ""
     try:
-        for chunk in _get_generator().stream(message, history):
+        model = _get_generator()
+        if is_off_topic(model, message, history):
+            # Redirect politely; prior turns are left out so the model can't answer from them.
+            chunks = model.stream(message, [], system_prompt=guard.OFF_TOPIC_SYSTEM_PROMPT)
+        else:
+            chunks = model.stream(message, history)
+        for chunk in chunks:
             if first_token_at is None:
                 first_token_at = time.perf_counter() - start
             text += chunk
@@ -347,7 +418,8 @@ def add_message(message, history):
         yield history, ""
         return
     prior = list(history)  # the model sees prior turns only, so the message isn't duplicated
-    shown = prior + [{"role": "user", "content": message}]
+    # Card numbers, SSNs and passwords are masked before the message is shown or stored.
+    shown = prior + [{"role": "user", "content": guard.redact(message)[0]}]
     # Yield a new list each time: Gradio streams by diffing each update against the last
     # one, so mutating a list that was already yielded can make updates disappear.
     yield shown + [{"role": "assistant", "content": ""}], ""

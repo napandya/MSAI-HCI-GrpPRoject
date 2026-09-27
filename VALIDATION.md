@@ -1,19 +1,29 @@
 # Validation — September 27, 2026
 
-Reverted the response layer back to the proposal's prompt-only LLM design
-(`google/flan-t5-base`, later swapped for `Qwen/Qwen2.5-0.5B-Instruct`), after a brief detour to hardcoded keyword matching that was not
-what the proposal committed to. The 20 automated unit tests pass; they mock the model
-itself so they run offline and check the surrounding logic (prompt construction, history
-truncation, fallback behavior on an empty message or a model error, chat message
-formatting) rather than the content of real model output.
+## Done
 
-**Not yet done, and needed before submission:**
-- Manual pass in the running app confirming the model's actual generated answers stay
-  grounded in the fixed policy for all six scenarios (playback, trial length, billing cycle,
-  plan-change timing, refunds, stream limits) and for at least one out-of-scope / off-topic
-  message.
-- If the model's answers drift, invent facts, or ignore the instructions (a known risk for
-  a small instruction-tuned model asked to follow several constraints from one prompt), note
-  that in the design document and consider the fallback model mentioned in the proposal.
-- Keyboard navigation, screen-reader behavior, and small-screen layout review (carried over
-  from the prior validation pass, still outstanding).
+- The response layer uses the proposal's prompt-only LLM design. The initial candidate,
+  `google/flan-t5-base`, tended to echo conversation text, so the default is now
+  `Qwen/Qwen2.5-0.5B-Instruct`, which the team confirmed gives better replies in the
+  running app.
+- Guardrails added: rule checks for instruction-override attempts and sensitive data
+  (masked in the chat, never sent to the model), a model-based scope check, and a
+  model-written redirect for off-topic questions.
+- The 30 automated unit tests pass. They replace the model with a stand-in and check the
+  surrounding logic: prompts, streaming, caching, the guard rules (including real support
+  messages that must not be blocked), off-topic routing, and chat formatting.
+- The prompt prefix cache was checked against a small local test model: it produces the
+  same tokens and scope-check scores as processing the full prompt.
+
+## Still to do before submission
+
+- Run `python evaluate_guard.py` with the real model and record its accuracy, the number of
+  support questions wrongly refused, and the average scope-check time. If support questions
+  are refused, lower `STREAMHUB_OFFTOPIC_THRESHOLD` or refine `guard.SCOPE_SYSTEM_PROMPT`.
+- Manual pass in the running app confirming the replies stay grounded in the policy for all
+  six scenarios (playback, trial length, billing cycle, plan-change timing, refunds, stream
+  limits), plus a few off-topic questions to check the redirects read naturally and never
+  answer the question.
+- Note any policy violations (for example the model stating a number of simultaneous
+  streams) in the design document.
+- Keyboard navigation, screen-reader behavior, and small-screen layout review.
