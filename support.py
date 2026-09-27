@@ -1,4 +1,11 @@
-"""LLM-driven support responses for StreamHub, grounded in a fixed policy prompt."""
+"""LLM-driven support responses for StreamHub, grounded in a fixed policy prompt.
+
+Works with two kinds of Hugging Face models, picked by STREAMHUB_MODEL:
+- encoder-decoder instruction models such as google/flan-t5-base (the default), which
+  get one flattened text prompt; and
+- small chat-tuned decoder models such as Qwen/Qwen2.5-0.5B-Instruct, which get the
+  policy as a system message plus the conversation through the model's chat template.
+"""
 import logging
 import os
 from functools import lru_cache
@@ -27,34 +34,110 @@ the demo's limit and summarize steps tried. Acknowledge frustration briefly.
 For unrelated requests explain your scope: playback, subscription and billing
 policies. Do not request passwords or payment details. If a fact is missing, say so."""
 
+SYSTEM_PROMPT = f"Policy:\n{SUPPORT_FACTS}\n\n{INSTRUCTIONS}"
+
 HELP_TEXT = ("I can help with playback, subscription timing, free trials, billing cycles, "
              "refund policy, and simultaneous-stream limits. Try one of the options below.")
 
-MAX_HISTORY_TURNS = 6  # keep the prompt short enough for flan-t5-base's context window
+MAX_HISTORY_TURNS = 6  # keep prompts short; flan-t5 only reads the first 512 tokens
+
+
+def content_text(content):
+    """Return plain text from a chat message's content.
+
+    Gradio 6 stores content as a list of blocks such as
+    [{"type": "text", "text": "..."}]; older versions use a plain string.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, dict):
+        return str(content.get("text", "")).strip()
+    if isinstance(content, (list, tuple)):
+        parts = [content_text(part) for part in content]
+        return " ".join(part for part in parts if part)
+    return str(content).strip()
+
+
+def clean_history(history):
+    """Recent turns as [{"role": "user"|"assistant", "content": str}], empties dropped."""
+    turns = []
+    for item in history or []:
+        if not isinstance(item, dict):
+            continue
+        text = content_text(item.get("content"))
+        if text:
+            role = "user" if item.get("role") == "user" else "assistant"
+            turns.append({"role": role, "content": text})
+    return turns[-MAX_HISTORY_TURNS:]
+
+
+def build_messages(message, history):
+    """Chat-format messages for chat-tuned models: system policy, prior turns, new message."""
+    return ([{"role": "system", "content": SYSTEM_PROMPT}]
+            + clean_history(history)
+            + [{"role": "user", "content": message}])
+
+
+def build_prompt(message, history):
+    """One flattened prompt for flan-t5, with the task stated last so the model answers it."""
+    earlier = "\n".join(
+        f"{'Customer' if turn['role'] == 'user' else 'Assistant'}: {turn['content']}"
+        for turn in clean_history(history)
+    ) or "(none)"
+    return (f"{SYSTEM_PROMPT}\n\n"
+            f"Earlier conversation:\n{earlier}\n\n"
+            f"Customer's latest message: {message}\n\n"
+            "Write the assistant's reply to the customer's latest message in 1-2 sentences, "
+            "using only the policy:")
 
 
 @lru_cache(maxsize=1)
 def _get_generator():
-    """Load the instruction-tuned model once and return a prompt -> text callable.
+    """Load the model once and return a (message, history) -> reply text callable.
 
-    Uses the tokenizer and seq2seq model classes directly instead of
-    pipeline("text2text-generation"), which was removed in transformers 5.
-    This works on both transformers 4.x and 5.x.
+    Loads with the Auto* classes directly rather than pipeline(), because
+    transformers 5 removed the text2text-generation pipeline. Works on 4.x and 5.x.
     """
     import torch
-    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
 
     logger.info("Loading %s (first run downloads it from Hugging Face)...", MODEL_NAME)
+    config = AutoConfig.from_pretrained(MODEL_NAME)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
-    model.eval()
-    logger.info("Model loaded.")
 
-    def generate(prompt, max_new_tokens=96, **_):
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+    if getattr(config, "is_encoder_decoder", False):
+        model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+        model.eval()
+        logger.info("Loaded %s as an encoder-decoder (flattened prompt).", MODEL_NAME)
+
+        def generate(message, history):
+            inputs = tokenizer(build_prompt(message, history), return_tensors="pt",
+                               truncation=True, max_length=512)
+            with torch.no_grad():
+                output_ids = model.generate(**inputs, max_new_tokens=96, do_sample=False,
+                                            no_repeat_ngram_size=3)
+            return tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+        return generate
+
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+    model.eval()
+    if getattr(tokenizer, "chat_template", None) is None:
+        raise ValueError(f"{MODEL_NAME} has no chat template; use an '-Instruct' or chat model.")
+    logger.info("Loaded %s as a chat model (system prompt + chat template).", MODEL_NAME)
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+
+    def generate(message, history):
+        inputs = tokenizer.apply_chat_template(build_messages(message, history),
+                                               add_generation_prompt=True,
+                                               return_tensors="pt", return_dict=True)
         with torch.no_grad():
-            output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-        return [{"generated_text": tokenizer.decode(output_ids[0], skip_special_tokens=True)}]
+            output_ids = model.generate(**inputs, max_new_tokens=120, do_sample=False,
+                                        repetition_penalty=1.1, pad_token_id=pad_id)
+        new_tokens = output_ids[0][inputs["input_ids"].shape[-1]:]
+        return tokenizer.decode(new_tokens, skip_special_tokens=True)
 
     return generate
 
@@ -69,30 +152,12 @@ def warm_up():
         return False
 
 
-def build_prompt(message, history):
-    """Assemble the fixed policy + instructions + recent turns into one flan-t5 prompt."""
-    turns = [item for item in (history or []) if isinstance(item, dict)][-MAX_HISTORY_TURNS:]
-    convo_lines = []
-    for turn in turns:
-        speaker = "User" if turn.get("role") == "user" else "Assistant"
-        content = str(turn.get("content", "")).strip()
-        if content:
-            convo_lines.append(f"{speaker}: {content}")
-    convo_lines.append(f"User: {message}")
-    convo_lines.append("Assistant:")
-    convo_text = "\n".join(convo_lines)
-    return f"{INSTRUCTIONS}\n\nPolicy:\n{SUPPORT_FACTS}\n\nConversation:\n{convo_text}"
-
-
 def response_for(message, history):
-    """Generate the assistant's reply from the model, grounded in the fixed policy prompt."""
+    """Generate the assistant's reply to `message`, given the turns *before* it."""
     if not message.strip():
         return HELP_TEXT
-    prompt = build_prompt(message, history)
     try:
-        generator = _get_generator()
-        result = generator(prompt, max_new_tokens=96)
-        text = result[0]["generated_text"].strip()
+        text = _get_generator()(message, history).strip()
     except Exception:
         # Log the full traceback to the terminal so the real cause is visible,
         # then tell the user plainly rather than faking a policy answer.
@@ -107,6 +172,7 @@ def add_message(message, history):
     message = (message or "").strip()
     if not message:
         return history, ""
+    reply = response_for(message, history)  # prior turns only, so the message isn't duplicated
     history.append({"role": "user", "content": message})
-    history.append({"role": "assistant", "content": response_for(message, history)})
+    history.append({"role": "assistant", "content": reply})
     return history, ""

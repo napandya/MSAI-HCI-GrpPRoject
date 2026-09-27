@@ -49,8 +49,24 @@ Open the URL Gradio prints, normally `http://127.0.0.1:7860`.
 The first run downloads `google/flan-t5-base` (~250MB) from Hugging Face, so it needs
 internet access once; after that it's cached locally and startup is fast. The model loads
 at startup, so if anything goes wrong (no network, missing package) the full error prints
-in the terminal before the app opens. To try a different seq2seq model, set the
-`STREAMHUB_MODEL` environment variable (for example `google/flan-t5-large`).
+in the terminal before the app opens.
+
+### Choosing a model
+
+Set the `STREAMHUB_MODEL` environment variable to swap models without code changes.
+Two kinds are supported:
+
+- **Encoder-decoder instruction models** (default `google/flan-t5-base`, or
+  `google/flan-t5-large`): get one flattened prompt. flan-t5-base is small and tends to
+  echo conversation text rather than reply in multi-turn chat.
+- **Chat-tuned instruction models** such as `Qwen/Qwen2.5-0.5B-Instruct` (~1GB, runs on a
+  laptop CPU): get the policy as a system message and the conversation through the
+  model's chat template, which usually follows the instructions much more closely.
+
+```powershell
+$env:STREAMHUB_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+python app.py
+```
 
 ## Validate
 
