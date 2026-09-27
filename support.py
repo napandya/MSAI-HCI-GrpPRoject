@@ -1,9 +1,11 @@
 """LLM-driven support responses for StreamHub, grounded in a fixed policy prompt."""
+import logging
+import os
 from functools import lru_cache
 
-from transformers import pipeline
+logger = logging.getLogger("streamhub")
 
-MODEL_NAME = "google/flan-t5-base"
+MODEL_NAME = os.environ.get("STREAMHUB_MODEL", "google/flan-t5-base")
 
 SUPPORT_FACTS = """StreamHub is a fictional streaming service.
 Playback: restart the app/device, then check the internet connection, then
@@ -33,8 +35,38 @@ MAX_HISTORY_TURNS = 6  # keep the prompt short enough for flan-t5-base's context
 
 @lru_cache(maxsize=1)
 def _get_generator():
-    """Load the instruction-tuned model once and reuse it for every turn."""
-    return pipeline("text2text-generation", model=MODEL_NAME)
+    """Load the instruction-tuned model once and return a prompt -> text callable.
+
+    Uses the tokenizer and seq2seq model classes directly instead of
+    pipeline("text2text-generation"), which was removed in transformers 5.
+    This works on both transformers 4.x and 5.x.
+    """
+    import torch
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+    logger.info("Loading %s (first run downloads it from Hugging Face)...", MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+    model.eval()
+    logger.info("Model loaded.")
+
+    def generate(prompt, max_new_tokens=96, **_):
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+        with torch.no_grad():
+            output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        return [{"generated_text": tokenizer.decode(output_ids[0], skip_special_tokens=True)}]
+
+    return generate
+
+
+def warm_up():
+    """Load the model at startup so errors show immediately in the terminal."""
+    try:
+        _get_generator()
+        return True
+    except Exception:
+        logger.exception("Could not load %s", MODEL_NAME)
+        return False
 
 
 def build_prompt(message, history):
@@ -59,12 +91,14 @@ def response_for(message, history):
     prompt = build_prompt(message, history)
     try:
         generator = _get_generator()
-        result = generator(prompt, max_new_tokens=96, do_sample=False)
+        result = generator(prompt, max_new_tokens=96)
         text = result[0]["generated_text"].strip()
     except Exception:
-        # The model failed to load or run (e.g. no network to download weights, or an
-        # inference error). Fail visibly rather than silently faking a policy answer.
-        return ("I'm having trouble reaching the support model right now. " + HELP_TEXT)
+        # Log the full traceback to the terminal so the real cause is visible,
+        # then tell the user plainly rather than faking a policy answer.
+        logger.exception("Model call failed")
+        return ("I'm having trouble reaching the support model right now "
+                "(see the terminal for details). " + HELP_TEXT)
     return text or HELP_TEXT
 
 

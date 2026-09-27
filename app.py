@@ -1,13 +1,20 @@
 """StreamHub support demo with a Teams-inspired, accessible chat layout."""
+import logging
+
 import gradio as gr
 
-from support import add_message
+from support import MODEL_NAME, add_message, warm_up
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 CSS = """
 :root { --teams: #5b5fc7; --ink: #242424; --muted: #616161; --line: #e0e0e0; }
-body, .gradio-container { background: #f5f5f5 !important; color: var(--ink) !important; font-family: Segoe UI, Arial, sans-serif !important; }
-.gradio-container { max-width: 1180px !important; padding: 0 !important; }
-.topbar { background: var(--teams); color: white; padding: 16px 28px; }.topbar h1 { margin: 0; font-size: 22px; font-weight: 600; }.topbar p { margin: 4px 0 0; font-size: 14px; opacity: .92; }
+html, body, gradio-app { background: #f5f5f5 !important; }
+body, .gradio-container { color: var(--ink) !important; font-family: Segoe UI, Arial, sans-serif !important; }
+.gradio-container { background: #f5f5f5 !important; max-width: 1180px !important; margin: 0 auto !important; padding: 0 !important; }
+.topbar { background: var(--teams); padding: 16px 28px; border-radius: 0 0 10px 10px; }
+.topbar h1, .topbar p { color: #ffffff !important; }
+.topbar h1 { margin: 0; font-size: 22px; font-weight: 600; }.topbar p { margin: 4px 0 0; font-size: 14px; opacity: .92; }
 .workspace { padding: 24px; gap: 20px; }.sidebar { background: white; border: 1px solid var(--line); border-radius: 10px; padding: 18px; }.sidebar h2 { font-size: 15px; margin: 0 0 8px; }.sidebar p { color: var(--muted); font-size: 13px; line-height: 1.45; }
 .chat-panel { background: white; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }.chat-panel .wrap { border: 0 !important; }.chat-panel .message { border-radius: 8px !important; }
 .quick button { text-align: left !important; border-color: #d1d1f0 !important; color: #424584 !important; background: #f5f5ff !important; }.send-row { border-top: 1px solid var(--line); padding: 12px; background: #fff; }.send-row textarea { min-height: 42px !important; }.footer-note { color: #616161; font-size: 12px; margin: 0 24px 20px; }
@@ -41,4 +48,7 @@ with gr.Blocks(title="StreamHub Support") as demo:
         button.click(choose, [gr.State(prompt), chat], [chat, message])
 
 if __name__ == "__main__":
+    if not warm_up():
+        print(f"\n*** {MODEL_NAME} failed to load; see the error above. "
+              "The chat will show a fallback message until this is fixed. ***\n")
     demo.launch(theme=gr.themes.Default(primary_hue="indigo"), css=CSS)
