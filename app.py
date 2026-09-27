@@ -1,168 +1,44 @@
-"""StreamHub: prompt-only support demo with bounded context and CPU controls."""
-import logging
-import os
-import queue
-import threading
-import time
-
+"""StreamHub support demo with a Teams-inspired, accessible chat layout."""
 import gradio as gr
-import torch
-from transformers import (
-    AutoModelForSeq2SeqLM, AutoTokenizer, StoppingCriteria,
-    StoppingCriteriaList, TextIteratorStreamer,
-)
 
-from support import build_prompt
+from support import add_message
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
-MODEL_NAME = os.getenv("STREAMHUB_MODEL", "google/flan-t5-large")
-MAX_NEW_TOKENS = int(os.getenv("STREAMHUB_MAX_NEW_TOKENS", "60"))
-REQUEST_TIMEOUT = float(os.getenv("STREAMHUB_TIMEOUT", "90"))
-if MAX_NEW_TOKENS <= 0 or REQUEST_TIMEOUT <= 0:
-    raise ValueError("Token limit and timeout must be positive.")
-if os.getenv("STREAMHUB_CPU_THREADS"):
-    torch.set_num_threads(int(os.environ["STREAMHUB_CPU_THREADS"]))
-
-model = tokenizer = None
-generation_lock = threading.Lock()
+CSS = """
+:root { --teams: #5b5fc7; --ink: #242424; --muted: #616161; --line: #e0e0e0; }
+body, .gradio-container { background: #f5f5f5 !important; color: var(--ink) !important; font-family: Segoe UI, Arial, sans-serif !important; }
+.gradio-container { max-width: 1180px !important; padding: 0 !important; }
+.topbar { background: var(--teams); color: white; padding: 16px 28px; }.topbar h1 { margin: 0; font-size: 22px; font-weight: 600; }.topbar p { margin: 4px 0 0; font-size: 14px; opacity: .92; }
+.workspace { padding: 24px; gap: 20px; }.sidebar { background: white; border: 1px solid var(--line); border-radius: 10px; padding: 18px; }.sidebar h2 { font-size: 15px; margin: 0 0 8px; }.sidebar p { color: var(--muted); font-size: 13px; line-height: 1.45; }
+.chat-panel { background: white; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }.chat-panel .wrap { border: 0 !important; }.chat-panel .message { border-radius: 8px !important; }
+.quick button { text-align: left !important; border-color: #d1d1f0 !important; color: #424584 !important; background: #f5f5ff !important; }.send-row { border-top: 1px solid var(--line); padding: 12px; background: #fff; }.send-row textarea { min-height: 42px !important; }.footer-note { color: #616161; font-size: 12px; margin: 0 24px 20px; }
+"""
 
 
-def load_model():
-    global model, tokenizer
-    if model is None:
-        started = time.perf_counter()
-        loaded_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-        loaded_model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
-        loaded_model.eval()
-        tokenizer, model = loaded_tokenizer, loaded_model
-        log.info("Loaded %s in %.2fs; CPU threads=%s", MODEL_NAME,
-                 time.perf_counter() - started, torch.get_num_threads())
+def choose(prompt, history):
+    return add_message(prompt, history)
 
 
-class StopRequest(StoppingCriteria):
-    def __init__(self, event, deadline):
-        self.event, self.deadline = event, deadline
+with gr.Blocks(title="StreamHub Support") as demo:
+    gr.HTML("<div class='topbar'><h1>StreamHub Support</h1><p>Virtual support for playback, plans, and billing</p></div>")
+    with gr.Row(elem_classes="workspace"):
+        with gr.Column(scale=1, min_width=240, elem_classes="sidebar"):
+            gr.HTML("<h2>How can we help?</h2><p>Choose a topic or type your own question. I’ll give clear policy guidance and step-by-step playback help.</p>")
+            with gr.Column(elem_classes="quick"):
+                playback = gr.Button("Troubleshoot playback", variant="secondary")
+                billing = gr.Button("Understand my billing cycle", variant="secondary")
+                plan = gr.Button("When does a plan change apply?", variant="secondary")
+                trial = gr.Button("How long is the free trial?", variant="secondary")
+        with gr.Column(scale=3, elem_classes="chat-panel"):
+            chat = gr.Chatbot(value=[{"role": "assistant", "content": "Hi, I’m the StreamHub virtual support assistant. What can I help with today?"}], height=470, show_label=False, layout="bubble")
+            with gr.Row(elem_classes="send-row"):
+                message = gr.Textbox(placeholder="Type a message", show_label=False, container=False, scale=8)
+                send = gr.Button("Send", variant="primary", scale=1)
+    gr.HTML("<p class='footer-note'>StreamHub is a fictional class-project service. This assistant cannot access accounts, change plans, or accept payment information.</p>")
 
-    def __call__(self, input_ids, scores, **kwargs):
-        return self.event.is_set() or time.perf_counter() >= self.deadline
-
-
-def respond(message, history):
-    if not message or not message.strip():
-        yield "What playback, subscription, or billing question can I help with?"
-        return
-    if model is None or tokenizer is None:
-        yield "The support assistant could not load. Please try again after the app is restarted."
-        return
-    if not generation_lock.acquire(blocking=False):
-        yield "The assistant is finishing another request. Please try again shortly."
-        return
-
-    worker = None
-    cancelled = threading.Event()
-    try:
-        try:
-            prompt = build_prompt(message.strip(), history,
-                                  lambda text: len(tokenizer.encode(text)))
-        except ValueError as exc:
-            yield str(exc)
-            return
-        inputs = tokenizer(prompt, return_tensors="pt")
-        streamer = TextIteratorStreamer(tokenizer, skip_special_tokens=True, timeout=0.25)
-        errors = queue.Queue()
-        done = threading.Event()
-        started = time.perf_counter()
-        deadline = started + REQUEST_TIMEOUT
-
-        def generate():
-            try:
-                with torch.inference_mode():
-                    model.generate(
-                        **inputs, streamer=streamer, max_new_tokens=MAX_NEW_TOKENS,
-                        do_sample=False, num_beams=1, use_cache=True,
-                        stopping_criteria=StoppingCriteriaList([StopRequest(cancelled, deadline)]),
-                    )
-            except Exception as exc:
-                log.exception("Generation failed")
-                errors.put(exc)
-            finally:
-                done.set()
-                generation_lock.release()
-
-        worker = threading.Thread(target=generate, daemon=True)
-        try:
-            worker.start()
-        except Exception:
-            worker = None
-            log.exception("Could not start generation")
-            yield "I couldn't start that response. Please try again."
-            return
-        text = ""
-        first_text = None
-        while True:
-            if not errors.empty():
-                yield "I couldn't finish that response. Please try again."
-                return
-            if time.perf_counter() >= deadline:
-                yield "This response took too long. Please try a shorter question or try again shortly."
-                return
-            try:
-                chunk = next(streamer)
-            except queue.Empty:
-                if done.is_set():
-                    if not errors.empty():
-                        yield "I couldn't finish that response. Please try again."
-                        return
-                    break
-                continue
-            except StopIteration:
-                break
-            text += chunk
-            if text.strip():
-                if first_text is None:
-                    first_text = time.perf_counter() - started
-                yield text
-        if not text.strip():
-            yield "I couldn't produce an answer. Please rephrase your question."
-        log.info("model=%s first_text_s=%s total_s=%.2f input_tokens=%s",
-                 MODEL_NAME, first_text, time.perf_counter() - started,
-                 inputs["input_ids"].shape[-1])
-    finally:
-        cancelled.set()
-        # The worker owns the lock until generation actually stops, including
-        # after UI cancellation or timeout. Never start overlapping CPU work.
-        if worker is None:
-            generation_lock.release()
-        else:
-            worker.join(timeout=0.1)
-
-
-with gr.Blocks() as demo:
-    gr.ChatInterface(
-        fn=respond,
-        title="StreamHub Support Bot",
-        description=(
-            "I'm StreamHub's virtual support assistant. I can guide playback "
-            "troubleshooting and explain subscription and billing policies. "
-            "StreamHub is a fictional class-project service. I can't access "
-            "accounts, change plans, or take payments. Don't share passwords "
-            "or payment details."
-        ),
-        examples=["The app keeps freezing. What should I try?",
-                  "When will my plan change take effect?",
-                  "How long is the free trial?"],
-        cache_examples=False,
-        concurrency_limit=1,
-        textbox=gr.Textbox(label="Your support question", placeholder="Ask a support question…",
-                           max_length=2000),
-    )
-
-demo.queue(max_size=8)
+    send.click(add_message, [message, chat], [chat, message])
+    message.submit(add_message, [message, chat], [chat, message])
+    for button, prompt in ((playback, "My video keeps buffering"), (billing, "What is my billing cycle?"), (plan, "When does a plan change apply?"), (trial, "How long is the free trial?")):
+        button.click(choose, [gr.State(prompt), chat], [chat, message])
 
 if __name__ == "__main__":
-    try:
-        load_model()
-    except Exception:
-        log.exception("Model loading failed")
-    demo.launch(theme=gr.themes.Soft(primary_hue="blue"))
+    demo.launch(theme=gr.themes.Default(primary_hue="indigo"), css=CSS)
