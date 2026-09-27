@@ -1,0 +1,4 @@
+gradio==6.28.0
+transformers==5.17.0
+torch>=2.2,<3
+sentencepiece>=0.2,<0.3
