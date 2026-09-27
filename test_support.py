@@ -254,5 +254,38 @@ class GuardedResponseTests(IsolatedCacheTest):
         self.assertEqual(model.prompts, [SYSTEM_PROMPT])
 
 
+class AccessibilitySettingsTests(unittest.TestCase):
+    """Fast guards for the accessibility fixes; accessibility_check.py tests them in a browser."""
+
+    @classmethod
+    def setUpClass(cls):
+        import app
+        cls.app = app
+        cls.config = app.demo.get_config_file()
+
+    def component(self, elem_id):
+        return next(c["props"] for c in self.config["components"]
+                    if c.get("props", {}).get("elem_id") == elem_id)
+
+    def test_message_box_has_a_label_containing_its_visible_text(self):
+        props = self.component("message-box")
+        self.assertIn(props["placeholder"].lower(), props["label"].lower())
+
+    def test_unlabeled_share_button_is_not_shown(self):
+        self.assertNotIn("share", self.component("support-chat")["buttons"])
+
+    def test_launch_settings_include_accessibility_css_and_script(self):
+        kwargs = self.app.LAUNCH_KWARGS
+        self.assertEqual(kwargs["footer_links"], [])  # low-contrast Gradio links removed
+        self.assertIn(":focus-visible", kwargs["css"])
+        self.assertIn("prefers-reduced-motion", kwargs["css"])
+        self.assertIn("sr-announcer", kwargs["head"])
+
+    def test_page_has_an_announcer_live_region_and_skip_link(self):
+        html = " ".join(str(c.get("props", {}).get("value", "")) for c in self.config["components"])
+        self.assertIn("id='sr-announcer' role='status' aria-live='polite'", html)
+        self.assertIn("Skip to message box", html)
+
+
 if __name__ == "__main__":
     unittest.main()

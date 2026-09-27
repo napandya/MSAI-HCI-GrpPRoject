@@ -29,7 +29,10 @@ which is the prompt-only design described in the project proposal.
 | `guard.py` | Guardrails: rule checks, the scope-check prompt, and the off-topic reply prompt. |
 | `test_support.py` | Unit tests (the model is replaced with a stand-in, so no download is needed). |
 | `evaluate_guard.py` | Measures guardrail accuracy against labeled messages using the real model. |
+| `accessibility_check.py` | Automated WCAG 2.2 AA checks in a real browser (axe-core plus keyboard, screen-reader, zoom, and reflow checks). |
+| `ACCESSIBILITY.md` | Accessibility audit findings, fixes, test method, and manual checks still to do. |
 | `VALIDATION.md` | Validation notes and the manual checks still to do. |
+| `requirements-dev.txt` | Extra packages for the accessibility check. |
 
 ## How a message is handled
 
@@ -92,6 +95,22 @@ at a time. Three things make it feel faster:
 The terminal logs time to first words and total time for each reply, and the scope-check
 decision with its probability.
 
+## Accessibility
+
+The chatbot targets WCAG 2.2 Level AA, the guidelines commonly used to assess ADA
+compliance for websites. An audit found nine issues, all fixed; see `ACCESSIBILITY.md` for
+details. In short:
+
+- all text meets contrast minimums, and the page keeps its checked light theme even when
+  the operating system is in dark mode;
+- every control works with the keyboard and shows a clear focus ring, and a
+  "Skip to message box" link comes first;
+- screen readers hear who sent each message, hear "StreamHub assistant is typing" when a
+  reply starts, and hear the complete reply once when it finishes (instead of word by word);
+- the message box has a proper label, controls are at least 24×24 px, and animations stop
+  when the OS "reduce motion" setting is on;
+- the layout works at 320px wide and at 200% zoom.
+
 ## Supported questions
 
 - Playback troubleshooting: restart, check the connection, then reinstall.
@@ -153,6 +172,17 @@ Runs 27 labeled messages (support questions, follow-ups, off-topic questions, ov
 attempts, and sensitive data) through the same checks the app uses. It prints accuracy, how
 many support questions were wrongly refused, every misclassified message, and the average
 scope-check time. Add your own cases to `CASES` in the script.
+
+**Accessibility** (about a minute, no model download):
+
+```powershell
+pip install -r requirements-dev.txt
+python -m playwright install chromium
+python accessibility_check.py
+```
+
+Runs 20 checks against WCAG 2.2 AA in a real browser; all currently pass. Manual
+screen-reader and keyboard checks are listed in `ACCESSIBILITY.md`.
 
 **Manual review**: see `VALIDATION.md` for the checks still to do in the running app.
 

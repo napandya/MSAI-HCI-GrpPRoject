@@ -1,0 +1,4 @@
+-r requirements.txt
+# For accessibility_check.py (then run: python -m playwright install chromium)
+playwright
+axe-playwright-python
