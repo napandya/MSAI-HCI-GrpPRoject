@@ -22,7 +22,8 @@ body, .gradio-container { color: var(--ink) !important; font-family: Segoe UI, A
 
 
 def choose(prompt, history):
-    return add_message(prompt, history)
+    # Must itself be a generator so Gradio streams the reply for quick-topic buttons too.
+    yield from add_message(prompt, history)
 
 
 with gr.Blocks(title="StreamHub Support") as demo:
