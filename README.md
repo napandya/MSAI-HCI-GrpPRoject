@@ -24,19 +24,26 @@ which is the prompt-only design described in the project proposal.
 
 | File | What it does |
 |---|---|
-| `app.py` | Gradio interface: header, topic shortcuts, chat panel, message box. |
-| `support.py` | Prompts, model loading, streaming generation, response and prompt caches. |
-| `guard.py` | Guardrails: rule checks, the scope-check prompt, and the off-topic reply prompt. |
-| `test_support.py` | Unit tests (the model is replaced with a stand-in, so no download is needed). |
-| `evaluate_guard.py` | Measures guardrail accuracy against labeled messages using the real model. |
-| `accessibility_check.py` | Automated WCAG 2.2 AA checks in a real browser (axe-core plus keyboard, screen-reader, zoom, and reflow checks). |
-| `ACCESSIBILITY.md` | Accessibility audit findings, fixes, test method, and manual checks still to do. |
-| `VALIDATION.md` | Validation notes and the manual checks still to do. |
+| `streamhub/service.py` | Core support service logic: prompts, routing, model orchestration, and caching. |
+| `streamhub/guardrails.py` | Guardrails: rule checks, scope prompt, and off-topic behavior. |
+| `streamhub/exception.py` + `streamhub/errors.py` | Exception types plus user-safe frontend error messages and event labels. |
+| `streamhub/model.py` | Model-layer exports and model-related API surface. |
+| `streamhub/ui.py` | UI-layer exports used by the Gradio app entrypoint. |
+| `config/settings.py` | Typed environment configuration and validation. |
+| `app.py` | Gradio interface entrypoint. |
+| `support.py` / `guard.py` | Compatibility shims for legacy imports (deprecated). |
+| `tests/` | Unit tests (model is replaced with a stand-in, so no model download is needed). |
+| `test_architecture.py` | Structure and exception-handling tests for package modules. |
+| `scripts/evaluate_guard.py` | Measures guardrail accuracy against labeled messages using the real model. |
+| `scripts/accessibility_check.py` | Automated WCAG 2.2 AA checks in a real browser (axe-core plus keyboard, screen-reader, zoom, and reflow checks). |
+| `scripts/benchmark.py` | Quick local benchmark for latency and route counts. |
+| `docs/ACCESSIBILITY.md` | Accessibility audit findings, fixes, test method, and manual checks still to do. |
+| `docs/VALIDATION.md` | Validation notes and the manual checks still to do. |
 | `requirements-dev.txt` | Extra packages for the accessibility check. |
 
 ## How a message is handled
 
-1. **Rule checks** (`guard.py`, no model involved). Two kinds of message get a fixed reply
+1. **Rule checks** (`streamhub/guardrails.py`, no model involved). Two kinds of message get a fixed reply
    and never reach the model:
    - attempts to override the bot's instructions, such as "ignore your instructions" or
      "what is your system prompt?";
@@ -54,7 +61,7 @@ which is the prompt-only design described in the project proposal.
    the model's scores for answering "yes" versus "no".
 4. **Reply.**
    - In scope: the model answers from the support policy (`SUPPORT_FACTS` and
-     `INSTRUCTIONS` in `support.py`) plus the last few conversation turns.
+     `INSTRUCTIONS` in `streamhub/service.py`) plus the last few conversation turns.
    - Off topic: the model writes a short, friendly redirect from `OFF_TOPIC_SYSTEM_PROMPT`.
      It acknowledges what was asked without answering it and lists what it can help with.
      Earlier turns are left out of this prompt so the model can't drift into answering.
@@ -98,7 +105,7 @@ decision with its probability.
 ## Accessibility
 
 The chatbot targets WCAG 2.2 Level AA, the guidelines commonly used to assess ADA
-compliance for websites. An audit found nine issues, all fixed; see `ACCESSIBILITY.md` for
+compliance for websites. An audit found nine issues, all fixed; see `docs/ACCESSIBILITY.md` for
 details. In short:
 
 - all text meets contrast minimums, and the page keeps its checked light theme even when
@@ -116,9 +123,11 @@ details. In short:
 - Playback troubleshooting: restart, check the connection, then reinstall.
 - Seven-day free trial.
 - Monthly billing cycle.
-- Plan changes apply at the next billing cycle, without mid-cycle proration.
+- Plan changes apply at the next billing cycle, with mid-cycle proration.
 - Refund limitations.
 - Simultaneous streams: explained as plan-dependent; exact limits are intentionally not included.
+- Trial cancellation/refund details: explicitly reported as not specified by policy.
+- Account actions (plan changes, payments, account access, agent transfer): explicitly reported as unsupported actions for this assistant.
 
 The app cannot access accounts, process payments, change plans, or accept sensitive information.
 
@@ -159,38 +168,40 @@ python -m unittest discover -v
 
 These cover prompt construction, streaming, the response cache (hits, misses, persistence,
 invalidation), the rule checks (including real support messages that must *not* be
-blocked), off-topic routing, fallback behavior, and Gradio chat formatting. They do not
-judge the content of real model replies.
+blocked), prompt-injection hardening (including obfuscated variants), fixed policy answers,
+off-topic routing, fallback behavior, and Gradio chat formatting. They do not judge the
+content of real model replies.
 
 **Guardrail accuracy** (uses the real model):
 
 ```powershell
-python evaluate_guard.py
+python -m scripts.evaluate_guard
 ```
 
 Runs 27 labeled messages (support questions, follow-ups, off-topic questions, override
-attempts, and sensitive data) through the same checks the app uses. It prints accuracy, how
-many support questions were wrongly refused, every misclassified message, and the average
-scope-check time. Add your own cases to `CASES` in the script.
+attempts, and sensitive data) through the same checks the app uses. It prints app accuracy,
+model-only scope accuracy, how many support questions were wrongly refused, every
+misclassified message, and the average scope-check time. Add your own cases to `CASES` in
+the script.
 
 **Accessibility** (about a minute, no model download):
 
 ```powershell
 pip install -r requirements-dev.txt
 python -m playwright install chromium
-python accessibility_check.py
+python -m scripts.accessibility_check
 ```
 
 Runs 20 checks against WCAG 2.2 AA in a real browser; all currently pass. Manual
-screen-reader and keyboard checks are listed in `ACCESSIBILITY.md`.
+screen-reader and keyboard checks are listed in `docs/ACCESSIBILITY.md`.
 
-**Manual review**: see `VALIDATION.md` for the checks still to do in the running app.
+**Manual review**: see `docs/VALIDATION.md` for the checks still to do in the running app.
 
 ## Limitations
 
 - The scope check is a judgment by a 0.5B-parameter model, so it will sometimes be wrong.
-  The threshold leans toward answering, and `evaluate_guard.py` measures how often it errs.
+  The threshold leans toward answering, and `scripts/evaluate_guard.py` measures how often it errs.
 - Rule checks catch common instruction-override phrasings, not every possible one. The
-  system prompt still tells the model to stay within the policy.
+  checks include some obfuscated phrasing, but they are pattern-based and still not perfect.
 - Replies are not checked after they are generated. A small model can occasionally state
   something the policy doesn't support, such as a number of simultaneous streams.
