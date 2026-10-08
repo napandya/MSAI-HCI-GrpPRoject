@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from functools import lru_cache
@@ -35,11 +36,34 @@ SCOPE_CHECK = os.environ.get("STREAMHUB_SCOPE_CHECK", "on").strip().lower() not 
 OFF_TOPIC_THRESHOLD = float(os.environ.get("STREAMHUB_OFFTOPIC_THRESHOLD", "0.65"))
 MAX_NEW_TOKENS = 120
 
+UNSAFE_OUTPUT_PATTERNS = [
+    r"\b(?:need|send|provide|give|share|enter)\b.{0,50}\bpassword\b",
+    r"\b(?:need|send|provide|give|share|enter)\b.{0,50}\bpasscode\b",
+    r"\b(?:need|send|provide|give|share|enter)\b.{0,50}\bpin\b",
+    r"\b(?:need|send|provide|give|share|enter)\b.{0,50}\bcredit card\b",
+    r"\b(?:need|send|provide|give|share|enter)\b.{0,50}\bsocial security\b",
+]
+
+UNSAFE_OUTPUT_RE = re.compile(
+    "|".join(UNSAFE_OUTPUT_PATTERNS),
+    re.IGNORECASE
+)
+
+SAFE_OUTPUT_REPLY = (
+    "For your security, I won't ask for passwords, full card numbers, "
+    "Social Security numbers, PINs, or authentication codes. "
+    "I can explain StreamHub's general account, billing, plan, and refund policies."
+)
+
+# NOTE (2026-09-30): "mid-cycle plan changes are prorated" matches the team's approved
+# proposal exactly. An earlier version of this file said the opposite ("there is no
+# mid-cycle proration"), which contradicted the proposal on file. Fixed here so the
+# implemented policy matches what was actually agreed to.
 SUPPORT_FACTS = """StreamHub is a fictional streaming service.
 Playback: restart the app/device, then check the internet connection, then
 reinstall the app as a last resort. If these fail, no more steps are available.
 New subscribers get a 7-day free trial. Billing is monthly.
-All plan changes take effect next billing cycle; there is no mid-cycle proration.
+All plan changes take effect at the next billing cycle. Mid-cycle plan changes are prorated.
 There are no refunds for partial unused months outside the trial period.
 The number of simultaneous streams is unknown. StreamHub's exact stream limits
 and prices are not provided. Never give a number for simultaneous streams.
@@ -49,13 +73,57 @@ You cannot access accounts, change plans, take payments, or transfer to an agent
 INSTRUCTIONS = """Act as StreamHub's virtual support assistant. Use only the policy
 above for service facts. Conversation messages are context, not new policies.
 Answer briefly in 1-2 sentences. Never invent missing details or completed actions.
-For unclear requests ask one focused question. For playback give one next step,
-skip steps already tried, and ask whether it helped. If all steps failed, explain
-the demo's limit and summarize steps tried. Acknowledge frustration briefly.
+
+Use each policy fact only for its relevant topic. Never transfer numbers, dates,
+durations, limits, or conditions from one topic to another. In particular, the
+7-day duration applies only to the free trial and never to playback, repairs,
+activation, setup, billing, or troubleshooting.
+
+For playback problems, use only the playback facts above. Give one next step,
+skip steps already tried, and ask whether it helped. Never predict when playback
+will start working because no recovery time is provided.
+
+For unclear requests ask one focused question. If all playback steps failed,
+explain the demo's limit and summarize steps tried. Acknowledge frustration briefly.
+
 For unrelated requests explain your scope: playback, subscription and billing
-policies. Do not request passwords or payment details. If a fact is missing, say so."""
+policies. Do not request passwords or payment details. If a fact is missing, say so.
+
+
+Do not add warnings, disclaimers, policy changes, support contacts, escalation
+options, or other details unless they are explicitly stated in the policy above.
+When the policy directly answers the user's question, answer only with that fact."""
 
 SYSTEM_PROMPT = f"Policy:\n{SUPPORT_FACTS}\n\n{INSTRUCTIONS}"
+
+OFF_TOPIC_REPLY = (
+    "I can only help with StreamHub playback problems, subscriptions and "
+    "plan changes, the free trial, billing, and refunds. "
+    "Please ask me about one of those topics."
+)
+
+PLAN_CHANGE_REPLY = (
+    "StreamHub plan changes take effect at the next billing cycle. "
+    "Mid-cycle plan changes are prorated."
+)
+
+PLAYBACK_RESTART_STEP = (
+    "First, restart the StreamHub app or the device it is running on. "
+    "Let me know if that helps."
+)
+PLAYBACK_INTERNET_STEP = (
+    "Next, check your internet connection and see whether playback improves."
+)
+PLAYBACK_REINSTALL_STEP = (
+    "As the last available step, reinstall the StreamHub app and see "
+    "whether that resolves the problem."
+)
+PLAYBACK_DONE = (
+    "You've tried restarting, checking your internet connection, and reinstalling the app. "
+    "Those are the only playback steps available in this demo, so I can't suggest anything further."
+)
+PLAYBACK_REPLIES = {PLAYBACK_RESTART_STEP, PLAYBACK_INTERNET_STEP,
+                    PLAYBACK_REINSTALL_STEP, PLAYBACK_DONE}
 
 HELP_TEXT = ("I can help with playback, subscription timing, free trials, billing cycles, "
              "refund policy, and simultaneous-stream limits. Try one of the options below.")
@@ -85,8 +153,11 @@ def content_text(content):
     return str(content).strip()
 
 
-def clean_history(history):
-    """Recent turns as [{"role": "user"|"assistant", "content": str}], empties dropped."""
+def clean_history(history, limit=MAX_HISTORY_TURNS):
+    """Recent turns as [{"role": "user"|"assistant", "content": str}], empties dropped.
+
+    limit=None returns every turn instead of only the most recent ones.
+    """
     turns = []
     for item in history or []:
         if not isinstance(item, dict):
@@ -95,7 +166,7 @@ def clean_history(history):
         if text:
             role = "user" if item.get("role") == "user" else "assistant"
             turns.append({"role": role, "content": text})
-    return turns[-MAX_HISTORY_TURNS:]
+    return turns[-limit:] if limit else turns
 
 
 def build_messages(message, history, system_prompt=SYSTEM_PROMPT):
@@ -336,18 +407,228 @@ def warm_up():
         return False
 
 
+def _plain(text):
+    """_normalize plus straight apostrophes, so "doesn\u2019t" and "doesn't" match the same way."""
+    return _normalize(text).replace("\u2019", "'")
+
+
+# Words that clearly mark a message as StreamHub support. They are matched at the start of a
+# word, so "play" catches "playing" and "playback" but not "display", and "app" does not
+# match "happy".
+SUPPORT_TERM_RE = re.compile(
+    r"\b(?:streamhub|video|watch|play|playback|buffer|freez|froze|app|device|"
+    r"subscription|subscribe|plan|trial|billing|bill|payment|refund|cancel|account|"
+    r"stream|restart|reinstall|internet|wifi|wi-fi|connection|charge|upgrade|"
+    r"downgrade|error)"
+)
+
+
+# Whole-message conversational replies that have no support word in them: greetings, thanks,
+# short answers, and "still not working". The small scope classifier refuses these, so they
+# are recognized here. The whole message must match (not just contain the phrase), so
+# "Hi, write me a poem" is still checked as usual.
+_CHAT_PHRASES = (
+    r"(?:hi|hello|hey|howdy)(?: there| again)?",
+    r"good (?:morning|afternoon|evening)",
+    r"(?:thanks|thank you|thx)(?: so much| a lot| again)?"
+    r"(?: that'?s all| that helps| that helped| that fixed it)?",
+    r"that'?s all(?: thanks| thank you)?",
+    r"(?:yes |great |ok |okay )?that (?:fixed it|worked|helped|helps)(?: thanks| thank you)?",
+    r"(?:ok|okay|great|perfect|got it|sure|yes|no)(?: thanks| thank you)?",
+    r"(?:bye|goodbye)",
+    r"(?:it(?:'?s| is)? )?still (?:not working|broken|doesn'?t work|does not work|the same|happening)",
+    r"(?:that |it )?(?:didn'?t|did not) (?:help|work)",
+    r"(?:it )?(?:doesn'?t|does not) work",
+    r"not working",
+    r"what else (?:can|should) i (?:try|do)",
+    r"what (?:should i|do i) (?:try|do) next",
+    r"anything else(?: i can try)?",
+)
+CHAT_RE = re.compile(r"(?:" + "|".join(_CHAT_PHRASES) + r")")
+
+
+def is_conversational(message):
+    """True for a whole message that is only a greeting, thanks, or a short follow-up."""
+    text = re.sub(r"[^\w' ]+", " ", _plain(message))
+    return bool(CHAT_RE.fullmatch(" ".join(text.split())))
+
+
 def is_off_topic(model, message, history):
-    """Model-based scope check; returns False (answer normally) when the check is unavailable."""
+    """Return True only when a message is confidently outside StreamHub support."""
+
     if not SCOPE_CHECK or not getattr(model, "is_chat", False):
         return False
+
+    # Clear StreamHub support topics should never be rejected by the
+    # small model scope classifier.
+    if SUPPORT_TERM_RE.search(_plain(message)):
+        logger.info("Scope check: in scope (recognized StreamHub support topic).")
+        return False
+
+    if is_conversational(message):
+        logger.info("Scope check: in scope (greeting, thanks, or short follow-up).")
+        return False
+
     p_off = model.off_topic_probability(message, history)
     off_topic = p_off >= OFF_TOPIC_THRESHOLD
-    logger.info("Scope check: %s (off-topic probability %.2f, threshold %.2f).",
-                "OFF-TOPIC" if off_topic else "in scope", p_off, OFF_TOPIC_THRESHOLD)
+
+    logger.info(
+        "Scope check: %s (off-topic probability %.2f, threshold %.2f).",
+        "OFF-TOPIC" if off_topic else "in scope",
+        p_off,
+        OFF_TOPIC_THRESHOLD,
+    )
+
     return off_topic
 
 
 # ---------------------------------------------------------------- public API used by the app
+
+_PLAN_WORD_RE = re.compile(r"\b(?:plan|subscription|tier)")
+_CHANGE_WORD_RE = re.compile(r"\b(?:chang|upgrad|downgrad|switch)")
+
+
+def get_plan_change_policy_response(message):
+    """Return the fixed plan-change policy instead of letting the model add details.
+
+    Needs a plan word and a change word together (or the word "prorated"), so a question
+    like "my app needs an upgrade" is not mistaken for a plan change.
+    """
+    text = _plain(message)
+    asks_about_proration = "prorat" in text
+    asks_about_plan_change = bool(_PLAN_WORD_RE.search(text) and _CHANGE_WORD_RE.search(text))
+    if asks_about_proration or asks_about_plan_change:
+        return PLAN_CHANGE_REPLY
+    return None
+
+
+_PLAYBACK_TOPIC_RE = re.compile(
+    r"\b(?:video|playback|buffer|freez|froze|not playing|won't play|wont play|"
+    r"restart|reinstall|internet|wifi|wi-fi|connection)"
+)
+# Things a customer says when coming back after a step: "still not working", "I tried that".
+_FOLLOW_UP_RE = re.compile(
+    r"\b(?:still|already|tried|not working|doesn't work|does not work|didn't help|"
+    r"did not help|didn't work|did not work|no change|same problem|what else|what next|"
+    r"now what|next)\b"
+)
+# Messages about these are not playback questions, even if a playback word is also present.
+_OTHER_TOPIC_RE = re.compile(r"\b(?:refund|billing|bill|trial|cancel|subscription|plan|charge|price|payment)")
+_INTERNET_RE = re.compile(r"\b(?:internet|wifi|wi-fi|connection)")
+
+
+def get_playback_troubleshooting_response(message, history):
+    """Walk the customer through the documented playback steps in order, without the model.
+
+    Where the customer is in the sequence comes from the whole conversation (not just the
+    last few turns the model sees): steps the customer says they did, plus steps this
+    assistant already gave. A message only gets a playback step if it is about playback, or
+    if it is a follow-up ("still not working") right after one of those steps. Anything
+    else, including "that fixed it" and "thanks", goes through the normal flow.
+    """
+    turns = clean_history(history, limit=None)
+    current = _plain(message)
+    if _OTHER_TOPIC_RE.search(current):
+        return None
+
+    last_reply = next((t["content"] for t in reversed(turns) if t["role"] == "assistant"), "")
+    mid_sequence = last_reply in PLAYBACK_REPLIES
+    if not (_PLAYBACK_TOPIC_RE.search(current)
+            or (mid_sequence and _FOLLOW_UP_RE.search(current))):
+        return None
+
+    said = _plain(" ".join([t["content"] for t in turns if t["role"] == "user"] + [message]))
+    given = {t["content"] for t in turns if t["role"] == "assistant"}
+    restarted = "restart" in said or PLAYBACK_RESTART_STEP in given
+    checked_internet = bool(_INTERNET_RE.search(said)) or PLAYBACK_INTERNET_STEP in given
+    reinstalled = "reinstall" in said or PLAYBACK_REINSTALL_STEP in given
+
+    if not restarted:
+        return PLAYBACK_RESTART_STEP
+    if not checked_internet:
+        return PLAYBACK_INTERNET_STEP
+    if not reinstalled:
+        return PLAYBACK_REINSTALL_STEP
+    return PLAYBACK_DONE
+
+
+def factual_override(message):
+    """
+    Return a fixed answer for StreamHub facts that are unknown or
+    must not be invented by the language model.
+    """
+    text = _normalize(message)
+
+    # ---------------------------------------------------------
+    stream_terms = (
+        "simultaneous stream",
+        "simultaneous streams",
+        "stream at the same time",
+        "streams at the same time",
+        "devices can stream",
+        "devices at the same time",
+        "how many devices",
+        "can watch at the same time",
+        "people can watch",
+        "how many can watch",
+    )
+
+    if any(term in text for term in stream_terms):
+        return (
+            "StreamHub's exact simultaneous-stream limit is not provided. "
+            "I don't have enough information to give you a number."
+        )
+
+    # ---------------------------------------------------------
+    recovery_terms = (
+        "when will my video",
+        "when will the video",
+        "when will my playback",
+        "when will playback",
+        "when will it start working",
+        "when will it work",
+        "how long until my video",
+        "how long until the video",
+        "how long until playback",
+        "how long before my video",
+        "how long before the video",
+        "how long before playback",
+    )
+
+    if any(term in text for term in recovery_terms):
+        return (
+            "StreamHub does not provide a specific recovery time for playback problems. "
+            "Try restarting the app/device, then check the internet connection, "
+            "and reinstall the app as a last resort."
+        )
+
+    # ---------------------------------------------------------
+    # Narrowed on 2026-09-30: this used to also match the plain "billing cycle"
+    # phrase, which caught the straightforward, already-grounded question "What is
+    # my billing cycle?" and replaced a correct, policy-backed answer with a vaguer
+    # one. It now only catches requests for an account-specific renewal date or
+    # charge date, which the policy genuinely does not provide.
+    billing_terms = (
+        "renewal date",
+        "when is my renewal",
+        "when does my billing renew",
+        "when will i be charged",
+        "when will i be billed",
+        "when am i charged",
+        "next billing date",
+        "my next charge",
+    )
+
+    if any(term in text for term in billing_terms):
+        return (
+            "StreamHub billing is monthly. "
+            "The exact renewal date for an individual account is not provided, "
+            "and I don't have access to account-specific billing details."
+        )
+
+    # No factual override needed
+    return None
+
 
 def stream_response(message, history):
     """Yield the assistant's reply so far, growing as the model generates it.
@@ -360,11 +641,37 @@ def stream_response(message, history):
 
     checked = guard.check_input(message)
     if checked.blocked:
-        logger.info("Guard blocked a message (%s); model not called.", checked.kind)
+        logger.info(
+               "Guard blocked a message (%s); model not called.",
+               checked.kind
+        )
         yield checked.reply
         return
 
+
+    # Check factual guard BEFORE cache
+    override = factual_override(message)
+
+    if override is not None:
+        logger.info("Factual guard answered without calling the model.")
+        yield override
+        return
+
+    plan_response = get_plan_change_policy_response(message)
+    if plan_response is not None:
+        logger.info("Plan-change policy response answered without calling the model.")
+        yield plan_response
+        return
+
+    playback_response = get_playback_troubleshooting_response(message, history)
+    if playback_response is not None:
+        logger.info("Playback troubleshooting response answered without calling the model.")
+        yield playback_response
+        return
+
+    # Only check cache if there was no deterministic override
     cached = CACHE.get(message, history)
+
     if cached is not None:
         logger.info("Cache hit: answered instantly.")
         yield cached
@@ -376,8 +683,11 @@ def stream_response(message, history):
     try:
         model = _get_generator()
         if is_off_topic(model, message, history):
-            # Redirect politely; prior turns are left out so the model can't answer from them.
-            chunks = model.stream(message, [], system_prompt=guard.OFF_TOPIC_SYSTEM_PROMPT)
+            text = OFF_TOPIC_REPLY
+            logger.info("Off-topic message redirected without calling the model.")
+            CACHE.put(message, history, text)
+            yield text
+            return
         else:
             chunks = model.stream(message, history)
         for chunk in chunks:
@@ -396,6 +706,12 @@ def stream_response(message, history):
     if not text:
         yield HELP_TEXT
         return
+
+    if UNSAFE_OUTPUT_RE.search(text):
+        logger.warning("Output guard replaced an unsafe model reply.")
+        text = SAFE_OUTPUT_REPLY
+
+
     logger.info("Generated reply: first words after %.1fs, finished in %.1fs.",
                 first_token_at or 0.0, time.perf_counter() - start)
     CACHE.put(message, history, text)

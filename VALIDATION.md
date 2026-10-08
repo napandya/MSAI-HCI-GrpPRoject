@@ -7,9 +7,10 @@
   `Qwen/Qwen2.5-0.5B-Instruct`, which the team confirmed gives better replies in the
   running app.
 - Guardrails added: rule checks for instruction-override attempts and sensitive data
-  (masked in the chat, never sent to the model), a model-based scope check, and a
-  model-written redirect for off-topic questions.
-- The 34 automated unit tests pass. They replace the model with a stand-in and check the
+  (masked in the chat, never sent to the model), a support keyword and greeting check plus a model-based
+  scope check, and a fixed redirect for off-topic questions. Fixed answers cover simultaneous
+  streams, playback recovery time, renewal dates, plan changes, and the playback step order.
+- The 48 automated unit tests pass. They replace the model with a stand-in and check the
   surrounding logic: prompts, streaming, caching, the guard rules (including real support
   messages that must not be blocked), off-topic routing, and chat formatting.
 - Accessibility audit against WCAG 2.2 AA: nine issues found and fixed, and

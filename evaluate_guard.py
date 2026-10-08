@@ -3,9 +3,11 @@
 Run:  python evaluate_guard.py
 
 Each labeled message goes through the same checks the app uses: the rule checks
-(instruction overrides, sensitive data), then the model's scope check. The script
-prints accuracy, every misclassified message, and the average scope-check time,
-which can go straight into the results paper. Add your own cases to CASES.
+(instruction overrides, sensitive data), then the scope decision. The script reports two
+accuracies: the app's decision (support keywords first, then the model's scope check) and
+the model's scope check on its own. It also prints every misclassified message and the
+average scope-check time, which can go straight into the results paper. Add your own
+cases to CASES.
 """
 import logging
 import time
@@ -55,14 +57,16 @@ CASES = [
 
 
 def classify(model, message, history):
+    """Return (app label, model-only label, (p_off, seconds)) for one message."""
     checked = guard.check_input(message)
     if checked.blocked:
-        return checked.kind, None
+        return checked.kind, checked.kind, None
     start = time.perf_counter()
     p_off = model.off_topic_probability(message, history)
     elapsed = time.perf_counter() - start
-    label = "off_topic" if p_off >= support.OFF_TOPIC_THRESHOLD else "ok"
-    return label, (p_off, elapsed)
+    model_label = "off_topic" if p_off >= support.OFF_TOPIC_THRESHOLD else "ok"
+    app_label = "off_topic" if support.is_off_topic(model, message, history) else "ok"
+    return app_label, model_label, (p_off, elapsed)
 
 
 def main():
@@ -73,22 +77,25 @@ def main():
         print("The scope check needs a chat model; set STREAMHUB_MODEL to one.")
         return
 
-    correct, times, misses = 0, [], []
+    correct, model_correct, times, misses = 0, 0, [], []
     for message, history, expected in CASES:
-        got, scope = classify(model, message, history)
+        got, model_got, scope = classify(model, message, history)
         detail = ""
         if scope is not None:
             detail = f"p(off-topic)={scope[0]:.2f}"
             times.append(scope[1])
         ok = got == expected
         correct += ok
+        model_correct += model_got == expected
         print(f"{'PASS' if ok else 'FAIL'}  expected {expected:<9} got {got:<9} {detail:<18} {message}")
         if not ok:
             misses.append((message, expected, got))
 
-    print(f"\nAccuracy: {correct}/{len(CASES)} ({100 * correct / len(CASES):.0f}%)")
+    total = len(CASES)
+    print(f"\nApp accuracy (keywords, then model scope check): {correct}/{total} ({100 * correct / total:.0f}%)")
+    print(f"Model scope check alone: {model_correct}/{total} ({100 * model_correct / total:.0f}%)")
     wrongly_refused = sum(1 for _, exp, got in misses if exp == "ok")
-    print(f"Support questions wrongly refused: {wrongly_refused}")
+    print(f"Support questions wrongly refused by the app: {wrongly_refused}")
     if times:
         print(f"Average scope-check time: {1000 * sum(times) / len(times):.0f} ms")
     if misses:
