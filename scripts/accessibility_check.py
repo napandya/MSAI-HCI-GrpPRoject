@@ -2,7 +2,7 @@
 
 Setup (once):   pip install playwright axe-playwright-python
                 python -m playwright install chromium
-Run:            python accessibility_check.py
+Run:            python -m scripts.accessibility_check
 
 The page runs with a stand-in model that streams a fixed reply, so no model download is
 needed and results are repeatable. The script runs axe-core (an automated WCAG rule
@@ -10,13 +10,13 @@ engine) at desktop and phone widths in light and dark mode, then checks things a
 cannot: keyboard order and focus visibility, speaker labels as screen readers get them,
 what the live announcer says while a reply streams, reflow, text spacing, and 200% zoom.
 
-Automated checks catch only part of WCAG. ACCESSIBILITY.md lists the manual checks
+Automated checks catch only part of WCAG. docs/ACCESSIBILITY.md lists the manual checks
 (real screen readers, voice control, cognitive load) that still need a person.
 """
 import sys
 import time
 
-import support
+import streamhub.service as support
 
 PORT = 7890
 URL = f"http://127.0.0.1:{PORT}"

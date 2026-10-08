@@ -1,6 +1,6 @@
 """Measure how well the guardrails sort messages, using the real model.
 
-Run:  python evaluate_guard.py
+Run:  python -m scripts.evaluate_guard
 
 Each labeled message goes through the same checks the app uses: the rule checks
 (instruction overrides, sensitive data), then the scope decision. The script reports two
@@ -12,8 +12,8 @@ cases to CASES.
 import logging
 import time
 
-import guard
-import support
+import streamhub.guardrails as guard
+import streamhub.service as support
 
 FOLLOW_UP_HISTORY = [
     {"role": "user", "content": "My video keeps buffering"},
