@@ -54,7 +54,7 @@ screen without horizontal scrolling.
 ```powershell
 pip install -r requirements-dev.txt
 python -m playwright install chromium
-python accessibility_check.py
+python -m scripts.accessibility_check
 ```
 
 It runs the real page with a stand-in model and checks:
@@ -101,4 +101,4 @@ submitted:
   magnifier users may prefer to wait until the reply is complete.
 - **Third-party component.** The chat window is a Gradio component. The fixes above
   override its styles and behavior; a future Gradio update could change its markup, so
-  rerun `accessibility_check.py` after upgrading Gradio.
+  rerun `python -m scripts.accessibility_check` after upgrading Gradio.
