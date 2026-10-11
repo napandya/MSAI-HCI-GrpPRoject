@@ -68,10 +68,11 @@ _LEETSPEAK = str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7
 _CARD_CANDIDATE_RE = re.compile(r"\b(?:\d[ -]?){13,19}\b")
 _SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
 # Match explicit credential statements while allowing non-numeric passwords.
-_PASSWORD_RE = re.compile(r"\b(password|passcode|pwd|pin)\b(\s+is|\s*[:=])\s*([^\s,.;:!?]+)",
+_PASSWORD_RE = re.compile(r"\b(password|passcode|pwd|pin)\b(\s+is\s+|\s*[:=]\s*)([^\s,.;:!?]+)",
                           re.IGNORECASE)
 _PASSWORD_STATUS_WORDS = {
-    "expired", "reset", "forgot", "forgotten", "incorrect", "invalid", "wrong", "changed"
+    "expired", "reset", "forgot", "forgotten", "incorrect", "invalid", "wrong", "changed",
+    "not", "stuck", "locked", "missing", "lost", "broken", "working", "failing", "rejected"
 }
 
 
@@ -116,7 +117,7 @@ def redact(text):
         if value in _PASSWORD_STATUS_WORDS:
             return match.group(0)
         found = True
-        return f"{match.group(1)}{match.group(2)} [hidden]"
+        return f"{match.group(1)}{match.group(2).rstrip()} [hidden]"
 
     text = _CARD_CANDIDATE_RE.sub(mask_card, text)
     text, ssn_count = _SSN_RE.subn("[SSN hidden]", text)

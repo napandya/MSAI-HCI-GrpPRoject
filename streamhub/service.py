@@ -406,8 +406,8 @@ def is_off_topic(model, message, history):
     return model.off_topic_probability(message, history) >= OFF_TOPIC_THRESHOLD
 
 
-_PLAN_WORD_RE = re.compile(r"\b(?:plan|subscription|tier)")
-_CHANGE_WORD_RE = re.compile(r"\b(?:chang|upgrad|downgrad|switch)")
+_PLAN_WORD_RE = re.compile(r"\b(?:plans?|subscriptions?|tiers?)\b")
+_CHANGE_WORD_RE = re.compile(r"\b(?:chang(?:e|es|ed|ing)|upgrad(?:e|es|ed|ing)|downgrad(?:e|es|ed|ing)|switch(?:es|ed|ing)?)\b")
 _PLAYBACK_TOPIC_RE = re.compile(
     r"\b(?:video|playback|buffer|freez|froze|not playing|won't play|wont play|restart|reinstall|internet|wifi|wi-fi|connection)"
 )
@@ -415,7 +415,9 @@ _FOLLOW_UP_RE = re.compile(
     r"\b(?:still|already|tried|not working|doesn't work|does not work|didn't help|did not help|didn't work|did not work|no change|same problem|what else|what next|now what|next)\b"
 )
 _OTHER_TOPIC_RE = re.compile(r"\b(?:refund|billing|bill|trial|cancel|subscription|plan|charge|price|payment)")
-_STEP_NEGATION_WINDOW_RE = r"(?:didn'?t|did not|haven'?t|have not|never|not)"
+# "not" alone is left out on purpose: "it's not working, I restarted" says the step WAS done.
+# "didn't help/work" describes the result of a step, so it does not count as a negation either.
+_STEP_NEGATION_WINDOW_RE = r"(?:(?:didn'?t|did not|haven'?t|have not)(?!\s+(?:help|work|fix|play))|never)"
 
 
 def get_plan_change_policy_response(message):
@@ -432,7 +434,7 @@ def _latest_user_step_state(turns, message, stems):
         if not any(re.search(rf"\b{stem}\w*\b", plain) for stem in stems):
             continue
         negated = any(
-            re.search(rf"\b{_STEP_NEGATION_WINDOW_RE}\b[^.?!]{{0,30}}\b{stem}\w*\b", plain)
+            re.search(rf"\b{_STEP_NEGATION_WINDOW_RE}\b[^.?!,;]{{0,30}}\b{stem}\w*\b", plain)
             for stem in stems
         )
         state = not negated
