@@ -1,0 +1,60 @@
+diff -ru -x __pycache__ a/streamhub/guardrails.py b/streamhub/guardrails.py
+--- a/streamhub/guardrails.py	2026-10-07 22:59:40.000000000 -0700
++++ b/streamhub/guardrails.py	2026-10-10 11:00:49.787791886 -0700
+@@ -68,10 +68,11 @@
+ _CARD_CANDIDATE_RE = re.compile(r"\b(?:\d[ -]?){13,19}\b")
+ _SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+ # Match explicit credential statements while allowing non-numeric passwords.
+-_PASSWORD_RE = re.compile(r"\b(password|passcode|pwd|pin)\b(\s+is|\s*[:=])\s*([^\s,.;:!?]+)",
++_PASSWORD_RE = re.compile(r"\b(password|passcode|pwd|pin)\b(\s+is\s+|\s*[:=]\s*)([^\s,.;:!?]+)",
+                           re.IGNORECASE)
+ _PASSWORD_STATUS_WORDS = {
+-    "expired", "reset", "forgot", "forgotten", "incorrect", "invalid", "wrong", "changed"
++    "expired", "reset", "forgot", "forgotten", "incorrect", "invalid", "wrong", "changed",
++    "not", "stuck", "locked", "missing", "lost", "broken", "working", "failing", "rejected"
+ }
+ 
+ 
+@@ -116,7 +117,7 @@
+         if value in _PASSWORD_STATUS_WORDS:
+             return match.group(0)
+         found = True
+-        return f"{match.group(1)}{match.group(2)} [hidden]"
++        return f"{match.group(1)}{match.group(2).rstrip()} [hidden]"
+ 
+     text = _CARD_CANDIDATE_RE.sub(mask_card, text)
+     text, ssn_count = _SSN_RE.subn("[SSN hidden]", text)
+diff -ru -x __pycache__ a/streamhub/service.py b/streamhub/service.py
+--- a/streamhub/service.py	2026-10-07 22:59:40.000000000 -0700
++++ b/streamhub/service.py	2026-10-10 11:01:10.386194524 -0700
+@@ -406,8 +406,8 @@
+     return model.off_topic_probability(message, history) >= OFF_TOPIC_THRESHOLD
+ 
+ 
+-_PLAN_WORD_RE = re.compile(r"\b(?:plan|subscription|tier)")
+-_CHANGE_WORD_RE = re.compile(r"\b(?:chang|upgrad|downgrad|switch)")
++_PLAN_WORD_RE = re.compile(r"\b(?:plans?|subscriptions?|tiers?)\b")
++_CHANGE_WORD_RE = re.compile(r"\b(?:chang(?:e|es|ed|ing)|upgrad(?:e|es|ed|ing)|downgrad(?:e|es|ed|ing)|switch(?:es|ed|ing)?)\b")
+ _PLAYBACK_TOPIC_RE = re.compile(
+     r"\b(?:video|playback|buffer|freez|froze|not playing|won't play|wont play|restart|reinstall|internet|wifi|wi-fi|connection)"
+ )
+@@ -415,7 +415,9 @@
+     r"\b(?:still|already|tried|not working|doesn't work|does not work|didn't help|did not help|didn't work|did not work|no change|same problem|what else|what next|now what|next)\b"
+ )
+ _OTHER_TOPIC_RE = re.compile(r"\b(?:refund|billing|bill|trial|cancel|subscription|plan|charge|price|payment)")
+-_STEP_NEGATION_WINDOW_RE = r"(?:didn'?t|did not|haven'?t|have not|never|not)"
++# "not" alone is left out on purpose: "it's not working, I restarted" says the step WAS done.
++# "didn't help/work" describes the result of a step, so it does not count as a negation either.
++_STEP_NEGATION_WINDOW_RE = r"(?:(?:didn'?t|did not|haven'?t|have not)(?!\s+(?:help|work|fix|play))|never)"
+ 
+ 
+ def get_plan_change_policy_response(message):
+@@ -432,7 +434,7 @@
+         if not any(re.search(rf"\b{stem}\w*\b", plain) for stem in stems):
+             continue
+         negated = any(
+-            re.search(rf"\b{_STEP_NEGATION_WINDOW_RE}\b[^.?!]{{0,30}}\b{stem}\w*\b", plain)
++            re.search(rf"\b{_STEP_NEGATION_WINDOW_RE}\b[^.?!,;]{{0,30}}\b{stem}\w*\b", plain)
+             for stem in stems
+         )
+         state = not negated
