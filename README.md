@@ -58,6 +58,80 @@ Each incoming message goes through this flow:
    - Streams generated output token-by-token.
    - Replaces unsafe generated output (for example, asking for passwords) with a fixed safe reply.
 
+## Architecture diagram
+
+```mermaid
+flowchart LR
+    U[User in Browser] --> UI[Gradio UI<br/>app.py]
+    UI --> S[Service Layer<br/>streamhub/service.py]
+
+    S --> G[Input Guardrails<br/>streamhub/guardrails.py]
+    S --> C[Response Cache<br/>.cache/streamhub_responses.json]
+    S --> F[Fixed Policy Overrides<br/>plan/playback/factual]
+    S --> SC[Scope Routing<br/>keyword + model threshold]
+    S --> M[Local Model Runtime<br/>Transformers + Torch]
+    M --> HF[(Hugging Face Model Hub<br/>first download only)]
+
+    S --> E[Safe Error/Fallback Replies<br/>streamhub/errors.py]
+    S --> CFG[Typed Settings<br/>config/settings.py]
+
+    G --> S
+    C --> S
+    F --> S
+    SC --> S
+    M --> S
+    E --> UI
+    S --> UI
+```
+
+## Sequence diagram (single message)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User
+    participant UI as Gradio UI (app.py)
+    participant Service as Service (streamhub/service.py)
+    participant Guard as Guardrails (streamhub/guardrails.py)
+    participant Cache as ResponseCache
+    participant Model as LocalModel
+
+    User->>UI: Send message
+    UI->>Service: add_message(message, history)
+    Service->>UI: Show user message immediately
+
+    Service->>Guard: check_input(message)
+    alt Blocked (injection/sensitive)
+        Guard-->>Service: blocked + fixed reply
+        Service-->>UI: return safe fixed reply
+    else Allowed
+        Service->>Service: fixed policy override checks
+        alt Deterministic policy hit
+            Service-->>UI: return fixed policy reply
+        else No deterministic hit
+            Service->>Cache: get(message, history)
+            alt Cache hit
+                Cache-->>Service: cached reply
+                Service-->>UI: return cached reply
+            else Cache miss
+                Service->>Service: off-topic routing check
+                alt Off-topic
+                    Service-->>UI: return redirect reply
+                else In scope
+                    Service->>Model: stream(message, history, policy prompt)
+                    loop token stream
+                        Model-->>Service: partial text
+                        Service-->>UI: streamed partial reply
+                    end
+                    Service->>Service: output safety + polish
+                    Service->>Cache: put(message, history, final reply)
+                    Service-->>UI: final reply
+                end
+            end
+        end
+    end
+```
+
 ## Repository structure
 
 | Path | Purpose |
